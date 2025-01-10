@@ -1,6 +1,7 @@
 from openmm import Context, NonbondedForce, GBSAOBCForce
 from openmm.app import element, Modeller, Simulation
-from openmm.unit import nanometers, kilojoules_per_mole, kelvin, is_quantity, MOLAR_GAS_CONSTANT_R
+from openmm.unit import nanometers, kelvin, is_quantity, MOLAR_GAS_CONSTANT_R
+from collections.abc import Sequence
 from copy import deepcopy
 import numpy as np
 
@@ -22,17 +23,17 @@ class ResidueTitration(object):
         self.currentIndex = -1
 
 class ConstantPh(object):
-    def __init__(self, topology, positions, explicitForceField, implicitForceField, residueVariants, referenceEnergies, relaxationSteps, explicitArgs, implicitArgs, integrator, relaxationIntegrator, platform=None, properties=None):
+    def __init__(self, topology, positions, pH, explicitForceField, implicitForceField, residueVariants, referenceEnergies, relaxationSteps, explicitArgs, implicitArgs, integrator, relaxationIntegrator, weights=None, platform=None, properties=None):
+        if not isinstance(pH, Sequence):
+            pH = [pH]
+        self.setPH(pH, weights)
+        self.currentPHIndex = 0
         self._explicitArgs = explicitArgs
         self._implicitArgs = implicitArgs
         self.relaxationSteps = relaxationSteps
         self.titrations = {}
         for resIndex, variants in residueVariants.items():
-            energies = []
-            for e in referenceEnergies[resIndex]:
-                # if is_quantity(e):
-                #     e = e.value_in_unit(kilojoules_per_mole)
-                energies.append(e)
+            energies = list(referenceEnergies[resIndex])
             self.titrations[resIndex] = ResidueTitration(variants, energies)
         implicitToExplicitResidueMap = []
         solventResidues = []
@@ -130,6 +131,7 @@ class ConstantPh(object):
             implicitProtonatedParams = titration.implicitStates[protonated].particleParameters
             explicitProtonatedExceptionParams = titration.explicitStates[protonated].exceptionParameters
             implicitProtonatedExceptionParams = titration.implicitStates[protonated].exceptionParameters
+            minHydrogens = min(state.numHydrogens for state in titration.explicitStates)
             for i in range(len(titration.explicitStates)):
                 if i != protonated:
                     oldExplicit = titration.explicitStates[i]
@@ -168,6 +170,8 @@ class ConstantPh(object):
                                 newImplicit.exceptionParameters[forceIndex][key] = [0.0]+list(implicitProtonatedExceptionParams[forceIndex][key][1:])
                     titration.explicitStates[i] = newExplicit
                     titration.implicitStates[i] = newImplicit
+                titration.explicitStates[i].numHydrogens -= minHydrogens
+                titration.implicitStates[i].numHydrogens -= minHydrogens
 
         # Create contexts or simulations for all the systems.
 
@@ -202,12 +206,33 @@ class ConstantPh(object):
         self.explicitExceptionIndex = self._findExceptionIndices(explicitSystem, self.explicitTopology)
         self.implicitExceptionIndex = self._findExceptionIndices(implicitSystem, self.implicitTopology)
 
-    def attemptMCStep(self, temperature, pH):
+    def setPH(self, pH, weights=None):
+        self.pH = pH
+        if weights is None:
+            self._weights = [0.0]*len(pH)
+            self._updateWeights = True
+            self._weightUpdateFactor = 1.0
+            self._histogram = [0]*len(pH)
+            self._hasMadeTransition = False
+        else:
+            self._weights = weights
+            self._updateWeights = False
+
+    @property
+    def weights(self):
+        return [x-self._weights[0] for x in self._weights]
+
+    def attemptMCStep(self, temperature):
         # Copy the positions to the implicit context.
 
         explicitPositions = self.simulation.context.getState(positions=True).getPositions(asNumpy=True).value_in_unit(nanometers)
         implicitPositions = explicitPositions[self.implicitAtomIndex]
         self.implicitContext.setPositions(implicitPositions)
+
+        # Perform simulated tempering.
+
+        if len(self.pH) > 1:
+            self._attemptPHChange()
 
         # Process the residues in random order.
 
@@ -238,7 +263,7 @@ class ConstantPh(object):
             kT = (MOLAR_GAS_CONSTANT_R*temperature)
             deltaRefEnergy = (titration.referenceEnergies[stateIndex] - titration.referenceEnergies[titration.currentIndex])
             deltaN = titration.implicitStates[stateIndex].numHydrogens - titration.implicitStates[titration.currentIndex].numHydrogens
-            w = (newEnergy-currentEnergy-deltaRefEnergy)/kT + deltaN*np.log(10.0)*pH
+            w = (newEnergy-currentEnergy-deltaRefEnergy)/kT + deltaN*np.log(10.0)*self.pH[self.currentPHIndex]
             if w > 0.0 and np.exp(-w) < np.random.random():
                 # Restore the previous state.
 
@@ -340,3 +365,36 @@ class ConstantPh(object):
                     p = force.getExceptionParameters(exceptionIndex[key])
                     force.setExceptionParameters(exceptionIndex[key], p[0], p[1], *exceptionParams)
             force.updateParametersInContext(context)
+
+    def _attemptPHChange(self):
+        # Compute the probability for each pH.  This is done in log space to avoid overflow.
+
+        hydrogens = sum(t.explicitStates[t.currentIndex].numHydrogens for t in self.titrations.values())
+        logProbability = [(self._weights[i]-hydrogens*np.log(10.0)*self.pH[i]) for i in range(len(self._weights))]
+        maxLogProb = max(logProbability)
+        offset = maxLogProb + np.log(sum(np.exp(x-maxLogProb) for x in logProbability))
+        probability = [np.exp(x-offset) for x in logProbability]
+        r = np.random.random_sample()
+        for j in range(len(probability)):
+            if r < probability[j]:
+                self.currentPHIndex = j
+                if self._updateWeights:
+                    # Update the weight factors.
+
+                    self._weights[j] -= self._weightUpdateFactor
+                    self._histogram[j] += 1
+                    minCounts = min(self._histogram)
+                    if minCounts > 20 and minCounts >= 0.2*sum(self._histogram)/len(self._histogram):
+                        # Reduce the weight update factor and reset the histogram.
+
+                        self._weightUpdateFactor *= 0.5
+                        self._histogram = [0]*len(self.pH)
+                        self._weights = [x-self._weights[0] for x in self._weights]
+                    elif not self._hasMadeTransition and probability[self.currentPHIndex] > 0.99:
+                        # Rapidly increase the weight update factor at the start of the simulation to find
+                        # a reasonable starting value.
+
+                        self._weightUpdateFactor *= 2.0
+                        self._histogram = [0]*len(self.pH)
+                return
+            r -= probability[j]
