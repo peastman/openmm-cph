@@ -22,7 +22,7 @@ class ResidueTitration(object):
         self.protonatedIndex = -1
         self.currentIndex = -1
 
-class ConstantPh(object):
+class ConstantPH(object):
     def __init__(self, topology, positions, pH, explicitForceField, implicitForceField, residueVariants, referenceEnergies, relaxationSteps, explicitArgs, implicitArgs, integrator, relaxationIntegrator, weights=None, platform=None, properties=None):
         if not isinstance(pH, Sequence):
             pH = [pH]
