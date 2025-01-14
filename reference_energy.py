@@ -13,7 +13,7 @@ class ReferenceEnergyFinder(object):
         if len(self.titration.explicitStates) != 2:
             raise ValueError("Only residues with two states are currently supported")
 
-    def findReferenceEnergies(self, iterations):
+    def findReferenceEnergies(self, iterations=20000, substeps=20):
         # Find an initial estimate of the reference energies just by computing the potential
         # energies of the states.
 
@@ -30,25 +30,30 @@ class ReferenceEnergyFinder(object):
 
         self.model.setPH([-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0])
         for i in range(1000):
-            self.model.simulation.step(20)
+            self.model.simulation.step(substeps)
             self.model.attemptMCStep(self.temperature)
         fractions = [[] for _ in range(len(self.model.pH))]
         for i in range(iterations):
-            self.model.simulation.step(20)
+            self.model.simulation.step(substeps)
             self.model.attemptMCStep(self.temperature)
             fractions[self.model.currentPHIndex].append(1.0 if self.titration.protonatedIndex == self.titration.currentIndex else 0.0)
         x = []
         y = []
+        w = []
         for i in range(len(fractions)):
             fraction = np.average(fractions[i])
-            if fraction >= 0.01 and fraction <= 0.99:
+            if fraction > 0.0 and fraction < 1.0:
                 x.append(self.model.pH[i])
                 y.append(np.log(fraction)-np.log(0.5))
+                if fraction < 0.5:
+                    count = sum(fractions[i])
+                else:
+                    count = len(fractions[i])-sum(fractions[i])
+                w.append(np.sqrt(count))
 
         # Fit a line through the data to better estimate when the fraction is exactly 0.5,
         # and compute the reference energy based on it.
 
-        polynomial = np.polyfit(x, y, 1)
-        root = np.roots(polynomial)
+        root = np.roots(np.polyfit(x, y, 1, w=w))[0]
         kT = MOLAR_GAS_CONSTANT_R*self.temperature
         self.titration.referenceEnergies[1] += kT*deltaN*np.log(10.0)*(self.pKa-root)

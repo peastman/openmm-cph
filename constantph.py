@@ -175,14 +175,14 @@ class ConstantPh(object):
 
         # Create contexts or simulations for all the systems.
 
-        self.simulation = Simulation(self.explicitTopology, explicitSystem, integrator, platform, properties)
+        self.simulation = Simulation(self.explicitTopology, explicitSystem, deepcopy(integrator), platform, properties)
         platform = self.simulation.context.getPlatform()
         if properties is None:
             self.implicitContext = Context(implicitSystem, deepcopy(integrator), platform)
-            self.relaxationContext = Context(relaxationSystem, relaxationIntegrator, platform)
+            self.relaxationContext = Context(relaxationSystem, deepcopy(relaxationIntegrator), platform)
         else:
             self.implicitContext = Context(implicitSystem, deepcopy(integrator), platform, properties)
-            self.relaxationContext = Context(relaxationSystem, relaxationIntegrator, platform, properties)
+            self.relaxationContext = Context(relaxationSystem, deepcopy(relaxationIntegrator), platform, properties)
         self.simulation.context.setPositions(explicitPositions)
         self.relaxationContext.setPositions(explicitPositions)
         self.implicitContext.setPositions(implicitPositions)
@@ -390,7 +390,7 @@ class ConstantPh(object):
                         self._weightUpdateFactor *= 0.5
                         self._histogram = [0]*len(self.pH)
                         self._weights = [x-self._weights[0] for x in self._weights]
-                    elif not self._hasMadeTransition and probability[self.currentPHIndex] > 0.99:
+                    elif not self._hasMadeTransition and probability[self.currentPHIndex] > 0.99 and self._weightUpdateFactor < 1024.0:
                         # Rapidly increase the weight update factor at the start of the simulation to find
                         # a reasonable starting value.
 
