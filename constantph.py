@@ -39,6 +39,7 @@ class ConstantPH(object):
             energies = list(referenceEnergies[resIndex])
             self.titrations[resIndex] = ResidueTitration(variants, energies)
         implicitToExplicitResidueMap = []
+        explicitToImplicitResidueMap = {}
         solventResidues = []
 
         # Build the implicit solvent topology by removing water and ions.
@@ -50,6 +51,8 @@ class ConstantPH(object):
                 solventResidues.append(residue)
             else:
                 implicitToExplicitResidueMap.append(residue.index-len(solventResidues))
+        for i, j in enumerate(implicitToExplicitResidueMap):
+            explicitToImplicitResidueMap[j] = i
         modeller = Modeller(topology, positions)
         modeller.delete(solventResidues)
         implicitTopology = modeller.topology
@@ -136,8 +139,8 @@ class ConstantPH(object):
             implicitProtonatedParams = titration.implicitStates[protonated].particleParameters
             explicitProtonatedExceptionParams = titration.explicitStates[protonated].exceptionParameters
             implicitProtonatedExceptionParams = titration.implicitStates[protonated].exceptionParameters
-            minHydrogens = min(state.numHydrogens for state in titration.explicitStates)
             explicitAtomIndices = {atom.name: atom.index for atom in explicitResidues[resIndex].atoms()}
+            implicitAtomIndices = {atom.name: atom.index for atom in implicitResidues[explicitToImplicitResidueMap[resIndex]].atoms()}
             for i in range(len(titration.explicitStates)):
                 if i != protonated:
                     oldExplicit = titration.explicitStates[i]
@@ -177,8 +180,9 @@ class ConstantPH(object):
                                 newImplicit.exceptionParameters[forceIndex][key] = [0.0]+list(implicitProtonatedExceptionParams[forceIndex][key][1:])
                     titration.explicitStates[i] = newExplicit
                     titration.implicitStates[i] = newImplicit
-                titration.explicitStates[i].numHydrogens -= minHydrogens
-                titration.implicitStates[i].numHydrogens -= minHydrogens
+            for i in range(len(titration.explicitStates)):
+                titration.explicitStates[i].atomIndices = explicitAtomIndices
+                titration.implicitStates[i].atomIndices = implicitAtomIndices
 
         # Create contexts or simulations for all the systems.
 
@@ -288,11 +292,11 @@ class ConstantPH(object):
                 t.currentIndex = i
                 self._applyStateToContext(t.explicitStates[i], self.simulation.context, self.explicitExceptionIndex)
                 self._applyStateToContext(t.explicitStates[i], self.relaxationContext, self.explicitExceptionIndex)
-            self.relaxationContext.setPositions(explicitPositions)
 
         # If anything changed, run some dynamics to let the water relax.
 
         if anyChange:
+            self.relaxationContext.setPositions(explicitPositions)
             self.relaxationContext.getIntegrator().step(self.relaxationSteps)
             relaxedPositions = self.relaxationContext.getState(positions=True).getPositions(asNumpy=True)
             self.simulation.context.setPositions(relaxedPositions)
