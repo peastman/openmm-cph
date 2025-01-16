@@ -1,6 +1,8 @@
 from openmm import Context, NonbondedForce, GBSAOBCForce
 from openmm.app import element, Modeller, Simulation
+from openmm.app.internal import compiled
 from openmm.unit import nanometers, kelvin, is_quantity, MOLAR_GAS_CONSTANT_R
+from openmm.unit import sum as unitsum
 from collections.abc import Sequence
 from copy import deepcopy
 import numpy as np
@@ -19,6 +21,7 @@ class ResidueTitration(object):
         self.referenceEnergies = referenceEnergies
         self.explicitStates = []
         self.implicitStates = []
+        self.explicitHydrogenIndices = []
         self.protonatedIndex = -1
         self.currentIndex = -1
 
@@ -109,6 +112,8 @@ class ConstantPH(object):
         modeller.addHydrogens(forcefield=implicitForceField, variants=variants)
         self.implicitTopology = modeller.topology
         implicitPositions = modeller.positions
+        explicitResidues = list(self.explicitTopology.residues())
+        implicitResidues = list(self.implicitTopology.residues())
 
         # Create systems for them.  Also create a third system that is identical to the explicit one,
         # but freezes non-solvent atoms.
@@ -124,7 +129,7 @@ class ConstantPH(object):
         # For each ResidueTitration, identify the fully protonated state.  Replace the other states
         # with ones that include all protons, setting the parameters of the missing ones to 0.
 
-        for titration in self.titrations.values():
+        for resIndex, titration in self.titrations.items():
             protonated = titration.protonatedIndex
             titration.currentIndex = protonated
             explicitProtonatedParams = titration.explicitStates[protonated].particleParameters
@@ -132,6 +137,7 @@ class ConstantPH(object):
             explicitProtonatedExceptionParams = titration.explicitStates[protonated].exceptionParameters
             implicitProtonatedExceptionParams = titration.implicitStates[protonated].exceptionParameters
             minHydrogens = min(state.numHydrogens for state in titration.explicitStates)
+            explicitAtomIndices = {atom.name: atom.index for atom in explicitResidues[resIndex].atoms()}
             for i in range(len(titration.explicitStates)):
                 if i != protonated:
                     oldExplicit = titration.explicitStates[i]
@@ -147,6 +153,7 @@ class ConstantPH(object):
                                 newExplicit.particleParameters[forceIndex][atomName] = params[atomName]
                             else:
                                 newExplicit.particleParameters[forceIndex][atomName] = self._get_zero_parameters(explicitProtonatedParams[forceIndex][atomName], explicitSystem.getForce(forceIndex))
+                                titration.explicitHydrogenIndices.append(explicitAtomIndices[atomName])
                     for forceIndex in newExplicit.exceptionParameters:
                         params = oldExplicit.exceptionParameters[forceIndex]
                         for key in newExplicit.exceptionParameters[forceIndex]:
@@ -191,8 +198,6 @@ class ConstantPH(object):
         # for copying positions.
 
         implicitAtomIndex = [None]*implicitSystem.getNumParticles()
-        explicitResidues = list(self.explicitTopology.residues())
-        implicitResidues = list(self.implicitTopology.residues())
         for implicitIndex, explicitIndex in enumerate(implicitToExplicitResidueMap):
             explicitRes = explicitResidues[explicitIndex]
             implicitRes = implicitResidues[implicitIndex]
@@ -225,9 +230,11 @@ class ConstantPH(object):
     def attemptMCStep(self, temperature):
         # Copy the positions to the implicit context.
 
-        explicitPositions = self.simulation.context.getState(positions=True).getPositions(asNumpy=True).value_in_unit(nanometers)
+        state = self.simulation.context.getState(positions=True)
+        explicitPositions = state.getPositions(asNumpy=True).value_in_unit(nanometers)
         implicitPositions = explicitPositions[self.implicitAtomIndex]
         self.implicitContext.setPositions(implicitPositions)
+        periodicDistance = compiled.periodicDistance(state.getPeriodicBoxVectors().value_in_unit(nanometers))
 
         # Perform simulated tempering.
 
@@ -238,22 +245,25 @@ class ConstantPH(object):
 
         anyChange = False
         for resIndex in np.random.permutation(list(self.titrations)):
-            titration = self.titrations[resIndex]
-            numStates = len(titration.implicitStates)
+            titrations = [self.titrations[resIndex]]
 
             # Select a new state for it.
 
-            if numStates == 2:
-                stateIndex = 1-titration.currentIndex
-            else:
-                stateIndex = titration.currentIndex
-                while stateIndex == titration.currentIndex:
-                    stateIndex = np.random.randint(numStates)
+            stateIndex = [self._selectNewState(titrations[0])]
+            if np.random.random() < 0.25:
+                # Consider a multisite titration in which two residues change.
+
+                neighbors = self._findNeighbors(resIndex, explicitPositions, periodicDistance)
+                if len(neighbors) > 0:
+                    i = np.random.choice(neighbors)
+                    titrations.append(self.titrations[i])
+                    stateIndex.append(self._selectNewState(titrations[-1]))
 
             # Compute the energy of the implicit solvent system in the current and new states.
 
             currentEnergy = self.implicitContext.getState(energy=True).getPotentialEnergy()
-            self._applyStateToContext(titration.implicitStates[stateIndex], self.implicitContext, self.implicitExceptionIndex)
+            for i, t in zip(stateIndex, titrations):
+                self._applyStateToContext(t.implicitStates[i], self.implicitContext, self.implicitExceptionIndex)
             newEnergy = self.implicitContext.getState(energy=True).getPotentialEnergy()
 
             # Decide whether to accept the new state.
@@ -261,22 +271,24 @@ class ConstantPH(object):
             if not is_quantity(temperature):
                 temperature = temperature*kelvin
             kT = (MOLAR_GAS_CONSTANT_R*temperature)
-            deltaRefEnergy = (titration.referenceEnergies[stateIndex] - titration.referenceEnergies[titration.currentIndex])
-            deltaN = titration.implicitStates[stateIndex].numHydrogens - titration.implicitStates[titration.currentIndex].numHydrogens
+            deltaRefEnergy = unitsum([t.referenceEnergies[i] - t.referenceEnergies[t.currentIndex] for i, t in zip(stateIndex, titrations)])
+            deltaN = unitsum([t.implicitStates[i].numHydrogens - t.implicitStates[t.currentIndex].numHydrogens for i, t in zip(stateIndex, titrations)])
             w = (newEnergy-currentEnergy-deltaRefEnergy)/kT + deltaN*np.log(10.0)*self.pH[self.currentPHIndex]
             if w > 0.0 and np.exp(-w) < np.random.random():
                 # Restore the previous state.
 
-                self._applyStateToContext(titration.implicitStates[titration.currentIndex], self.implicitContext, self.implicitExceptionIndex)
+                for t in titrations:
+                    self._applyStateToContext(t.implicitStates[t.currentIndex], self.implicitContext, self.implicitExceptionIndex)
                 continue
             anyChange = True
 
             # Apply the new state.
 
-            titration.currentIndex = stateIndex
+            for i, t in zip(stateIndex, titrations):
+                t.currentIndex = i
+                self._applyStateToContext(t.explicitStates[i], self.simulation.context, self.explicitExceptionIndex)
+                self._applyStateToContext(t.explicitStates[i], self.relaxationContext, self.explicitExceptionIndex)
             self.relaxationContext.setPositions(explicitPositions)
-            self._applyStateToContext(titration.explicitStates[stateIndex], self.simulation.context, self.explicitExceptionIndex)
-            self._applyStateToContext(titration.explicitStates[stateIndex], self.relaxationContext, self.explicitExceptionIndex)
 
         # If anything changed, run some dynamics to let the water relax.
 
@@ -365,6 +377,30 @@ class ConstantPH(object):
                     p = force.getExceptionParameters(exceptionIndex[key])
                     force.setExceptionParameters(exceptionIndex[key], p[0], p[1], *exceptionParams)
             force.updateParametersInContext(context)
+
+    def _selectNewState(self, titration):
+        numStates = len(titration.implicitStates)
+        if numStates == 2:
+            return 1-titration.currentIndex
+        stateIndex = titration.currentIndex
+        while stateIndex == titration.currentIndex:
+            stateIndex = np.random.randint(numStates)
+        return stateIndex
+
+    def _findNeighbors(self, resIndex, explicitPositions, periodicDistance):
+        neighbors = []
+        titration1 = self.titrations[resIndex]
+        for resIndex2 in self.titrations:
+            if resIndex2 > resIndex:
+                titration2 = self.titrations[resIndex2]
+                isNeighbor = False
+                for i in titration1.explicitHydrogenIndices:
+                    for j in titration2.explicitHydrogenIndices:
+                        if periodicDistance(explicitPositions[i], explicitPositions[j]) < 0.2:
+                            isNeighbor = True
+                if isNeighbor:
+                    neighbors.append(resIndex2)
+        return neighbors
 
     def _attemptPHChange(self):
         # Compute the probability for each pH.  This is done in log space to avoid overflow.
