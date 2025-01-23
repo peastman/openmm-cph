@@ -45,7 +45,10 @@ This package makes a few assumptions you need to be aware of.
    you must be able to parameterize the model with a ForceField object.  You cannot use models
    that were parameterized in another program and loaded from Amber, CHARMM, or Gromacs files.
 3. Changing the state of a residue can only affect parameters within that residue.  It cannot
-   change per-particle parameters of atoms in other residues, nor can it affect bonded
-   interactions (including 1-4 Coulomb interactions) that involve an atom in another residue.
+   change per-particle parameters of atoms in other residues, nor can it affect nonbonded
+   exceptions (e.g. 1-4 Coulomb interactions) that involve an atom in another residue.
    In practice, this means you can vary sites on the side chains of a protein, but not ones on
    the backbone.
+4. It can only modify parameters of the following forces: NonbondedForce, GBSAOBCForce, and
+   any custom force that has a per-particle parameter called "charge".  This means, for example,
+   that it cannot be used with the AMOEBA force field.

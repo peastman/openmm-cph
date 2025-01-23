@@ -26,7 +26,58 @@ class ResidueTitration(object):
         self.currentIndex = -1
 
 class ConstantPH(object):
-    def __init__(self, topology, positions, pH, explicitForceField, implicitForceField, residueVariants, referenceEnergies, relaxationSteps, explicitArgs, implicitArgs, integrator, relaxationIntegrator, weights=None, platform=None, properties=None):
+    """
+    Construct a ConstantPH object that can be used to run a simulation at constant pH.
+
+    Parameters
+    ----------
+    topology: openmm.app.Topology
+        This describes to model to simulate.  If a residue can exist in multiple protonation states, this Topology may
+        use any one of them.  The alternate versions will be constructed by calling `Modeller.addHydrogens()`.
+    positions: list
+        The initial positions of the atoms
+    pH: float or list
+        The pH to perform the simulation at.  If this is a single number, the simulation will be at a single fixed pH.
+        If it is a list of numbers, simulated tempering will be used to explore a range of pH values.  Each time a
+        Monte Carlo move is attempt, the simulation might also transition to a different pH.
+    explicitForceField: openmm.app.ForceField
+        The force field to use for parameterizing the system used in the simulation.  This should correspond to
+        explicit solvent.
+    implicitForceField: openmm.app.ForceField
+        The force field to use for parameterizing the system used in evaluating Monte Carlo moves.  This should
+        correspond to implicit solvent.
+    residueVariants: dict
+        This should contain one entry for every titratable residue.  Each key should be the index of a residue in the
+        Topology.  The corresponding value should be a list of variants that can be created by passing them to
+        `Modeller.addHydrogens()`.  Most often they will simply be strings, for example `{1: ['CYS', 'CYX']}`, but
+        they can also be detailed descriptions of the exact hydrogens to add.  See the documentation on `addHydrogens()`
+        for details.
+    referenceEnergies: dict
+        The reference energies of the titratable residues in a similar format to `residueVariants`.  Each key should be
+        the index of a residue in the Topology.  The corresponding value should be a list of energies in the same order
+        as `residueVariants`.
+    relaxationSteps: int
+        The number of integration steps to perform to relax solvent after a Monte Carlo move is accepted.
+    explicitArgs: dict
+        Any arguments to pass to `ForceField.createSystem()` when creating the explicit solvent system.
+    implicitArgs: dict
+        Any arguments to pass to `ForceField.createSystem()` when creating the implicit solvent system.
+    integrator: openmm.Integrator
+        The integrator to use for the simulation.
+    relaxationIntegrator: openmm.Integrator
+        The integrator to use for relaxing solvent after an accepted Monte Carlo move.
+    weights: list, optional
+        The weight factor to use for each pH in the simulated tempering algorithm.  This may be None, in which case
+        weights are determined automatically with the Wang-Landau algorithm.  In that case, it takes some time for the
+        weights to converge.  Data from that initial period should be discarded; until the weights have converged, the
+        simulation does not follow the correct distribution.
+    platform: openmm.Platform, optional
+        The Platform to use for running the simulation.  If this is None, a Platform is selected automatically.
+    properties: dict, optional
+        Platform-specific properties to pass to the Context's constructor.
+    """
+    def __init__(self, topology, positions, pH, explicitForceField, implicitForceField, residueVariants, referenceEnergies,
+                 relaxationSteps, explicitArgs, implicitArgs, integrator, relaxationIntegrator, weights=None, platform=None, properties=None):
         if not isinstance(pH, Sequence):
             pH = [pH]
         self.setPH(pH, weights)
@@ -216,6 +267,10 @@ class ConstantPH(object):
         self.implicitExceptionIndex = self._findExceptionIndices(implicitSystem, self.implicitTopology)
 
     def setPH(self, pH, weights=None):
+        """
+        Set the pH to run the simulation at.  See the description of the `pH` and `weights` arguments to the constructor
+        for more details.
+        """
         self.pH = pH
         if weights is None:
             self._weights = [0.0]*len(pH)
@@ -229,9 +284,21 @@ class ConstantPH(object):
 
     @property
     def weights(self):
+        """
+        Get the current values of the weights used in the simulated tempering algorithm.  This has one value for each pH.
+        """
         return [x-self._weights[0] for x in self._weights]
 
     def attemptMCStep(self, temperature):
+        """
+        Attempt to change the protonation states of all titratable residues.  If simulated tempering is being used, this
+        will also attempt to change to a new pH
+
+        Parameters
+        ----------
+        temperature: float
+            the temperature the simulation is being run at
+        """
         # Copy the positions to the implicit context.
 
         state = self.simulation.context.getState(positions=True)
@@ -302,6 +369,19 @@ class ConstantPH(object):
             self.simulation.context.setPositions(relaxedPositions)
 
     def setResidueState(self, residueIndex, stateIndex, relax=False):
+        """
+        Set a titratable residue to be in a particular state.
+
+        Parameters
+        ----------
+        residueIndex: int
+            The index of the residue to modify
+        stateIndex: int
+            The index of the state to put it into
+        relax: bool
+            If True, the solvent is allowed to relax after changing the state by immobilizing the solute and performing
+            a short simulation.
+        """
         titration = self.titrations[residueIndex]
         self._applyStateToContext(titration.explicitStates[stateIndex], self.simulation.context, self.explicitExceptionIndex)
         self._applyStateToContext(titration.explicitStates[stateIndex], self.relaxationContext, self.explicitExceptionIndex)
@@ -313,6 +393,7 @@ class ConstantPH(object):
             self.simulation.context.setPositions(self.relaxationContext.getState(positions=True).getPositions(asNumpy=True))
 
     def _findResidueStates(self, topology, positions, forcefield, variants, ffargs):
+        """Given a ForceField and a list of variants for the variable residues, construct ResidueState objects for them."""
         modeller = Modeller(topology, positions)
         modeller.addHydrogens(forcefield=forcefield, variants=variants)
         system = forcefield.createSystem(modeller.topology, **ffargs)
@@ -342,6 +423,9 @@ class ConstantPH(object):
         return states
 
     def _findExceptionIndices(self, system, topology):
+        """Construct a dict whose keys are (residue index, atom 1 name, atom 2 name), and whose values are the indices
+        of the corresponding exceptions in the NonbondedForce.  This is needed for mapping exceptions between Topologies
+        with different sets of atoms."""
         indices = {}
         atoms = list(topology.atoms())
         for force in system.getForces():
@@ -356,6 +440,7 @@ class ConstantPH(object):
         return indices
 
     def _get_zero_parameters(self, original_parameters, force):
+        """Get the per-particle parameter values that should be used to set an atom's charge to 0."""
         p = list(original_parameters)
         if isinstance(force, NonbondedForce) or isinstance(force, GBSAOBCForce):
             p[0] = 0.0
@@ -366,6 +451,7 @@ class ConstantPH(object):
         return tuple(p)
 
     def _applyStateToContext(self, state, context, exceptionIndex):
+        """Given a ResidueState, update parameters in a Context to match that state."""
         for forceIndex, params in state.particleParameters.items():
             force = context.getSystem().getForce(forceIndex)
             for atomName, atomParams in params.items():
@@ -383,6 +469,7 @@ class ConstantPH(object):
             force.updateParametersInContext(context)
 
     def _selectNewState(self, titration):
+        """Randomly choose a new state for a ResidueTitration."""
         numStates = len(titration.implicitStates)
         if numStates == 2:
             return 1-titration.currentIndex
@@ -392,6 +479,8 @@ class ConstantPH(object):
         return stateIndex
 
     def _findNeighbors(self, resIndex, explicitPositions, periodicDistance):
+        """Find other titratable residues that are very close to a specified residue.  This is used for
+        multisite titrations."""
         neighbors = []
         titration1 = self.titrations[resIndex]
         for resIndex2 in self.titrations:
@@ -407,6 +496,7 @@ class ConstantPH(object):
         return neighbors
 
     def _attemptPHChange(self):
+        """Attempt to change to a different pH."""
         # Compute the probability for each pH.  This is done in log space to avoid overflow.
 
         hydrogens = sum(t.explicitStates[t.currentIndex].numHydrogens for t in self.titrations.values())

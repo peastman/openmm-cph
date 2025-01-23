@@ -1,12 +1,28 @@
-from openmm.unit import kilojoules_per_mole, MOLAR_GAS_CONSTANT_R
+from openmm.unit import kilojoules_per_mole, kelvin, is_quantity, MOLAR_GAS_CONSTANT_R
 import numpy as np
 
 class ReferenceEnergyFinder(object):
     def __init__(self, model, pKa, temperature):
+        """
+        Construct a ReferenceEnergyFinder.
+
+        Parameters
+        ----------
+        model: ConstantPH
+            The model for which to determine reference energies.  It must contain a single titratable residue with
+            exactly two states.  It does not matter what pH or reference energies were specified when it was created,
+            because they will both be overwritten.
+        pKa: float
+            The experimental pKa of the titratable residue.  Reference energies will be chosen to match it.
+        temperature: openmm.unit.Quantity
+            The temperature at which the simulation will be run.
+        """
         if len(model.titrations) != 1:
             raise ValueError("The model compound must contain a single titratable residue")
         self.model = model
         self.pKa = pKa
+        if not is_quantity(temperature):
+            temperature = temperature*kelvin
         self.temperature = temperature
         self.residueIndex = list(model.titrations.keys())[0]
         self.titration = model.titrations[self.residueIndex]
@@ -14,6 +30,18 @@ class ReferenceEnergyFinder(object):
             raise ValueError("Only residues with two states are currently supported")
 
     def findReferenceEnergies(self, iterations=20000, substeps=20):
+        """
+        Compute the reference energies for the states of the model compound.  On exit, they will be stored in
+        the ConstantPH object.
+
+        Parameters
+        ----------
+        iterations: int
+            The number of Monte Carlo moves to attempt.  The larger the number, the more tightly converged
+            the results will be.
+        subsets: int
+            The number of dynamics steps to integrate between Monte Carlo moves.
+        """
         # Find an initial estimate of the reference energies just by computing the potential
         # energies of the states.
 
