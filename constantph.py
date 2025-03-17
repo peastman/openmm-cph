@@ -507,6 +507,8 @@ class ConstantPH(object):
         r = np.random.random_sample()
         for j in range(len(probability)):
             if r < probability[j]:
+                if j != self.currentPHIndex:
+                    self._hasMadeTransition = True
                 self.currentPHIndex = j
                 if self._updateWeights:
                     # Update the weight factors.
