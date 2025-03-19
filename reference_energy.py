@@ -1,4 +1,5 @@
 from openmm.unit import kilojoules_per_mole, kelvin, is_quantity, MOLAR_GAS_CONSTANT_R
+from scipy.optimize import curve_fit
 import numpy as np
 
 class ReferenceEnergyFinder(object):
@@ -56,32 +57,34 @@ class ReferenceEnergyFinder(object):
         # If our initial estimate is exact, the fractions should be equal at pH 0.  Since it probably
         # isn't, simulate it at various pHs to refine the estimate.
 
-        self.model.setPH([-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0])
-        for i in range(1000):
-            self.model.simulation.step(substeps)
-            self.model.attemptMCStep(self.temperature)
-        fractions = [[] for _ in range(len(self.model.pH))]
-        for i in range(iterations):
-            self.model.simulation.step(substeps)
-            self.model.attemptMCStep(self.temperature)
-            fractions[self.model.currentPHIndex].append(1.0 if self.titration.protonatedIndex == self.titration.currentIndex else 0.0)
-        x = []
-        y = []
-        w = []
-        for i in range(len(fractions)):
-            fraction = np.average(fractions[i])
-            if fraction > 0.0 and fraction < 1.0:
-                x.append(self.model.pH[i])
-                y.append(np.log(fraction)-np.log(0.5))
-                if fraction < 0.5:
-                    count = sum(fractions[i])
-                else:
-                    count = len(fractions[i])-sum(fractions[i])
-                w.append(np.sqrt(count))
+        while True:
+            self.model.setPH([-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0])
+            for i in range(1000):
+                self.model.simulation.step(substeps)
+                self.model.attemptMCStep(self.temperature)
+            fractions = [[] for _ in range(len(self.model.pH))]
+            for i in range(iterations):
+                self.model.simulation.step(substeps)
+                self.model.attemptMCStep(self.temperature)
+                fractions[self.model.currentPHIndex].append(1.0 if self.titration.protonatedIndex == self.titration.currentIndex else 0.0)
 
-        # Fit a line through the data to better estimate when the fraction is exactly 0.5,
-        # and compute the reference energy based on it.
+            # Fit a curve to the data to better estimate when the fraction is exactly 0.5,
+            # and compute the reference energy based on it.
 
-        root = np.roots(np.polyfit(x, y, 1, w=w))[0]
-        kT = MOLAR_GAS_CONSTANT_R*self.temperature
-        self.titration.referenceEnergies[1] += kT*deltaN*np.log(10.0)*(self.pKa-root)
+            x = []
+            y = []
+            for i in range(len(fractions)):
+                if len(fractions[i]) > 0:
+                    x.append(self.model.pH[i])
+                    y.append(np.average(fractions[i]))
+
+            def f(ph, pka):
+                return 1/(1+10**(ph-pka))
+
+            popt, pcov = curve_fit(f, x, y, [0.0])
+            root = popt[0]
+            dE = MOLAR_GAS_CONSTANT_R*self.temperature*deltaN*np.log(10.0)*(self.pKa-root)
+            if root > -2 and root < 2:
+                self.titration.referenceEnergies[1] += dE
+                break
+            self.titration.referenceEnergies[1] += 0.5*dE

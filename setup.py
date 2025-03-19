@@ -37,5 +37,5 @@ setup(
     classifiers=CLASSIFIERS.splitlines(),
     packages=find_packages(),
     zip_safe=False,
-    install_requires=['openmm >= 8.2'])
+    install_requires=['openmm >= 8.2', 'scipy'])
 
