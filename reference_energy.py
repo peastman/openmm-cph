@@ -51,8 +51,11 @@ class ReferenceEnergyFinder(object):
         self.model.setResidueState(self.residueIndex, 1)
         energy1 = self.model.implicitContext.getState(energy=True).getPotentialEnergy()
         deltaN = self.titration.implicitStates[1].numHydrogens - self.titration.implicitStates[0].numHydrogens
+        scale = MOLAR_GAS_CONSTANT_R*self.temperature*deltaN*np.log(10.0)
         self.titration.referenceEnergies[0] = 0.0*kilojoules_per_mole
         self.titration.referenceEnergies[1] = energy1-energy0
+        self.model.simulation.minimizeEnergy()
+        self.model.simulation.context.setVelocitiesToTemperature(self.temperature)
 
         # If our initial estimate is exact, the fractions should be equal at pH 0.  Since it probably
         # isn't, simulate it at various pHs to refine the estimate.
@@ -83,8 +86,7 @@ class ReferenceEnergyFinder(object):
 
             popt, pcov = curve_fit(f, x, y, [0.0])
             root = popt[0]
-            dE = MOLAR_GAS_CONSTANT_R*self.temperature*deltaN*np.log(10.0)*(self.pKa-root)
             if root > -2 and root < 2:
-                self.titration.referenceEnergies[1] += dE
+                self.titration.referenceEnergies[1] += scale*(self.pKa-root)
                 break
-            self.titration.referenceEnergies[1] += 0.5*dE
+            self.titration.referenceEnergies[1] -= scale*root
