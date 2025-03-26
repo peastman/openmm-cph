@@ -1,8 +1,10 @@
 from openmm import Context, NonbondedForce, GBSAOBCForce
 from openmm.app import element, Modeller, Simulation
+from openmm.app.forcefield import NonbondedGenerator
 from openmm.app.internal import compiled
-from openmm.unit import nanometers, kelvin, is_quantity, MOLAR_GAS_CONSTANT_R
+from openmm.unit import nanometers, kelvin, elementary_charge, is_quantity, MOLAR_GAS_CONSTANT_R
 from openmm.unit import sum as unitsum
+from collections import defaultdict
 from collections.abc import Sequence
 from copy import deepcopy
 import numpy as np
@@ -265,6 +267,13 @@ class ConstantPH(object):
 
         self.explicitExceptionIndex = self._findExceptionIndices(explicitSystem, self.explicitTopology)
         self.implicitExceptionIndex = self._findExceptionIndices(implicitSystem, self.implicitTopology)
+        self.explicitInterResidue14 = self._findInterResidue14(explicitSystem, self.explicitTopology)
+        self.implicitInterResidue14 = self._findInterResidue14(implicitSystem, self.implicitTopology)
+
+        # Record the scale factors for 1-4 Coulomb interactions.
+
+        self.explicit14Scale = self._find14Scale(explicitForceField)
+        self.implicit14Scale = self._find14Scale(implicitForceField)
 
     def setPH(self, pH, weights=None):
         """
@@ -334,7 +343,7 @@ class ConstantPH(object):
 
             currentEnergy = self.implicitContext.getState(energy=True).getPotentialEnergy()
             for i, t in zip(stateIndex, titrations):
-                self._applyStateToContext(t.implicitStates[i], self.implicitContext, self.implicitExceptionIndex)
+                self._applyStateToContext(t.implicitStates[i], self.implicitContext, self.implicitExceptionIndex, self.implicitInterResidue14, self.implicit14Scale)
             newEnergy = self.implicitContext.getState(energy=True).getPotentialEnergy()
 
             # Decide whether to accept the new state.
@@ -349,7 +358,7 @@ class ConstantPH(object):
                 # Restore the previous state.
 
                 for t in titrations:
-                    self._applyStateToContext(t.implicitStates[t.currentIndex], self.implicitContext, self.implicitExceptionIndex)
+                    self._applyStateToContext(t.implicitStates[t.currentIndex], self.implicitContext, self.implicitExceptionIndex, self.implicitInterResidue14, self.implicit14Scale)
                 continue
             anyChange = True
 
@@ -357,8 +366,8 @@ class ConstantPH(object):
 
             for i, t in zip(stateIndex, titrations):
                 t.currentIndex = i
-                self._applyStateToContext(t.explicitStates[i], self.simulation.context, self.explicitExceptionIndex)
-                self._applyStateToContext(t.explicitStates[i], self.relaxationContext, self.explicitExceptionIndex)
+                self._applyStateToContext(t.explicitStates[i], self.simulation.context, self.explicitExceptionIndex, self.explicitInterResidue14, self.explicit14Scale)
+                self._applyStateToContext(t.explicitStates[i], self.relaxationContext, self.explicitExceptionIndex, self.explicitInterResidue14, self.explicit14Scale)
 
         # If anything changed, run some dynamics to let the water relax.
 
@@ -383,9 +392,9 @@ class ConstantPH(object):
             a short simulation.
         """
         titration = self.titrations[residueIndex]
-        self._applyStateToContext(titration.explicitStates[stateIndex], self.simulation.context, self.explicitExceptionIndex)
-        self._applyStateToContext(titration.explicitStates[stateIndex], self.relaxationContext, self.explicitExceptionIndex)
-        self._applyStateToContext(titration.implicitStates[stateIndex], self.implicitContext, self.implicitExceptionIndex)
+        self._applyStateToContext(titration.explicitStates[stateIndex], self.simulation.context, self.explicitExceptionIndex, self.explicitInterResidue14, self.explicit14Scale)
+        self._applyStateToContext(titration.explicitStates[stateIndex], self.relaxationContext, self.explicitExceptionIndex, self.explicitInterResidue14, self.explicit14Scale)
+        self._applyStateToContext(titration.implicitStates[stateIndex], self.implicitContext, self.implicitExceptionIndex, self.implicitInterResidue14, self.implicit14Scale)
         titration.currentIndex = stateIndex
         if relax:
             self.relaxationContext.setPositions(self.simulation.context.getState(positions=True).getPositions(asNumpy=True))
@@ -439,6 +448,28 @@ class ConstantPH(object):
                         indices[(atom1.residue.index, atom2.name, atom1.name)] = i
         return indices
 
+    def _findInterResidue14(self, system, topology):
+        """For each residue, record the indices of all 1-4 exceptions that span that residue and another one."""
+        indices = defaultdict(list)
+        atoms = list(topology.atoms())
+        for force in system.getForces():
+            if isinstance(force, NonbondedForce):
+                for i in range(force.getNumExceptions()):
+                    p1, p2, chargeProd, sigma, epsilon = force.getExceptionParameters(i)
+                    atom1 = atoms[p1]
+                    atom2 = atoms[p2]
+                    if atom1.residue != atom2.residue and chargeProd.value_in_unit(elementary_charge**2) != 0.0:
+                        indices[atom1.residue.index].append(i)
+                        indices[atom2.residue.index].append(i)
+        return indices
+
+    def _find14Scale(self, forcefield):
+        """Find the scale factor for 1-4 Coulomb interactions."""
+        for generator in forcefield.getGenerators():
+            if isinstance(generator, NonbondedGenerator):
+                return generator.coulomb14scale
+        return 1.0
+
     def _get_zero_parameters(self, original_parameters, force):
         """Get the per-particle parameter values that should be used to set an atom's charge to 0."""
         p = list(original_parameters)
@@ -450,7 +481,7 @@ class ConstantPH(object):
                     p[i] = 0.0
         return tuple(p)
 
-    def _applyStateToContext(self, state, context, exceptionIndex):
+    def _applyStateToContext(self, state, context, exceptionIndex, interResidue14, coulomb14Scale):
         """Given a ResidueState, update parameters in a Context to match that state."""
         for forceIndex, params in state.particleParameters.items():
             force = context.getSystem().getForce(forceIndex)
@@ -466,6 +497,11 @@ class ConstantPH(object):
                 for key, exceptionParams in state.exceptionParameters[forceIndex].items():
                     p = force.getExceptionParameters(exceptionIndex[key])
                     force.setExceptionParameters(exceptionIndex[key], p[0], p[1], *exceptionParams)
+                for index in interResidue14[state.residueIndex]:
+                    p1, p2, _, sigma, epsilon = force.getExceptionParameters(index)
+                    q1, _, _ = force.getParticleParameters(p1)
+                    q2, _, _ = force.getParticleParameters(p2)
+                    force.setExceptionParameters(index, p1, p2, coulomb14Scale*q1*q2, sigma, epsilon)
             force.updateParametersInContext(context)
 
     def _selectNewState(self, titration):
