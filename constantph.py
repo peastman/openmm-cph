@@ -310,7 +310,7 @@ class ConstantPH(object):
         """
         # Copy the positions to the implicit context.
 
-        state = self.simulation.context.getState(positions=True)
+        state = self.simulation.context.getState(positions=True, parameters=True)
         explicitPositions = state.getPositions(asNumpy=True).value_in_unit(nanometers)
         implicitPositions = explicitPositions[self.implicitAtomIndex]
         self.implicitContext.setPositions(implicitPositions)
@@ -373,6 +373,9 @@ class ConstantPH(object):
 
         if anyChange:
             self.relaxationContext.setPositions(explicitPositions)
+            self.relaxationContext.setPeriodicBoxVectors(*state.getPeriodicBoxVectors())
+            for param in self.relaxationContext.getParameters():
+                self.relaxationContext.setParameter(param, state.getParameters()[param])
             self.relaxationContext.getIntegrator().step(self.relaxationSteps)
             relaxedPositions = self.relaxationContext.getState(positions=True).getPositions(asNumpy=True)
             self.simulation.context.setPositions(relaxedPositions)
